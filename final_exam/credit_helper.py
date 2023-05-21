@@ -205,3 +205,33 @@ def calibrate_cds_hazard_rate_curve(calc_date, sofr_yield_curve_handle, cds_par_
     hazard_rate_curve.enableExtrapolation()
 
     return(hazard_rate_curve)
+
+# Calculate initial term and current time-to-maturity for each bond issue
+def get_symbology(df, underlying=False):
+    for index, row in df.iterrows():
+        start_date = ql.Date(row['start_date'].day, row['start_date'].month, row['start_date'].year)
+        maturity_date = ql.Date(row['maturity'].day, row['maturity'].month, row['maturity'].year)
+        today_date = ql.Date(14,4,2023)
+        calendar = ql.UnitedStates(ql.UnitedStates.GovernmentBond)
+        #set dcc as Actual/365.25
+        dcc = ql.Actual36525()
+        initial_term = dcc.yearFraction(start_date, maturity_date)
+        current_time_to_maturity = dcc.yearFraction(today_date, maturity_date)
+        df.at[index, 'term'] = initial_term
+        df.at[index, 'TTM'] = current_time_to_maturity
+    
+    df['term'] = round(df['term'],2)
+
+    return df
+
+def calc_clean_price_with_zspread(fixed_rate_bond, yield_curve_handle, zspread):
+    zspread_quote = ql.SimpleQuote(zspread)
+    zspread_quote_handle = ql.QuoteHandle(zspread_quote)
+    yield_curve_bumped = ql.ZeroSpreadedTermStructure(yield_curve_handle, zspread_quote_handle, ql.Compounded, ql.Semiannual)
+    yield_curve_bumped_handle = ql.YieldTermStructureHandle(yield_curve_bumped)
+    
+    # Set Valuation engine
+    bond_engine = ql.DiscountingBondEngine(yield_curve_bumped_handle)
+    fixed_rate_bond.setPricingEngine(bond_engine)
+    bond_clean_price = fixed_rate_bond.cleanPrice()
+    return bond_clean_price
