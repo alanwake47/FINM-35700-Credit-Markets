@@ -235,3 +235,20 @@ def calc_clean_price_with_zspread(fixed_rate_bond, yield_curve_handle, zspread):
     fixed_rate_bond.setPricingEngine(bond_engine)
     bond_clean_price = fixed_rate_bond.cleanPrice()
     return bond_clean_price
+
+def get_interp_tsy_yield(corp_symbology, otr):
+    corp_symbology['interp_tsy_yield'] = 0
+    for i in range(len(corp_symbology)):
+        if corp_symbology['TTM'][i] <= otr['TTM'][0]:
+            corp_symbology['interp_tsy_yield'][i] = otr['mid_yield'][0]
+        elif corp_symbology['TTM'][i] >= otr['TTM'][len(otr)-1]:
+            corp_symbology['interp_tsy_yield'][i] = otr['mid_yield'][len(otr)-1]
+        else:
+            ttm_temp = corp_symbology['TTM'][i]
+            for j in range(len(otr)):
+                if otr['TTM'][j] == ttm_temp:
+                    corp_symbology['interp_tsy_yield'][i] = otr['mid_yield'][j]
+                elif otr['TTM'][j] > ttm_temp:
+                    corp_symbology['interp_tsy_yield'][i] = otr['mid_yield'][j-1] + (ttm_temp - otr['TTM'][j-1])*(otr['mid_yield'][j] - otr['mid_yield'][j-1])/(otr['TTM'][j] - otr['TTM'][j-1])
+                    break
+    return corp_symbology
