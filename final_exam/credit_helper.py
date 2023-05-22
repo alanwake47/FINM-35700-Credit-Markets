@@ -252,3 +252,67 @@ def get_interp_tsy_yield(corp_symbology, otr):
                     corp_symbology['interp_tsy_yield'][i] = otr['mid_yield'][j-1] + (ttm_temp - otr['TTM'][j-1])*(otr['mid_yield'][j] - otr['mid_yield'][j-1])/(otr['TTM'][j] - otr['TTM'][j-1])
                     break
     return corp_symbology
+
+# Create a plot using a QuantLib PiecewiseLogCubicDiscount curve
+def plot_yield_curve(mid, start_date: ql.Date, end_date: ql.Date, day_count: ql.DayCounter,label: str, CurveType="yield"):
+    '''Plot a yield curve from start_date to end_date using a QuantLib PiecewiseLogCubicDiscount curve.
+    '''
+    # Create a list of dates from start_date to end_date
+    dates = [start_date + ql.Period(i, ql.Years) for i in range(0, (end_date.year() - start_date.year())+1)]
+    
+    #Create another list of dates from start_date to end_date with a 6 month frequency
+    dates_6m = [start_date + ql.Period(i, ql.Months) for i in range(0, (end_date.year() - start_date.year())*12+1, 6)]
+    
+    # Create a list of discount factors from the yield curve
+    discount_factors_mid = [mid.discount(d) for d in dates]
+    discount_factors_mid_6m = [mid.discount(d) for d in dates_6m]    
+    
+    # Create a list of mid yields from the yield curve for each date
+    mid_yields = [mid.zeroRate(d, day_count, ql.Continuous).rate() for d in dates]
+    
+    # Create a dataframe of dates, discount factors and zero rates
+    df = pd.DataFrame(list(zip(dates, discount_factors_mid, mid_yields)), columns=['Date', 'MidDiscountFactors', 'MidYields'])
+    
+    #Convert Quantlib dates to Python dates
+    df['Date'] = df['Date'].apply(lambda x: x.to_date())
+    
+    
+    if CurveType == "yield":
+        # Plot the zero rates
+        plt.figure(figsize=(15, 6))
+        plt.plot(df['Date'], df['MidYields'], label="mid_yield")
+        #, show each year on the x-axis
+        plt.xticks(df['Date'], df['Date'].apply(lambda x: x.strftime('%Y')), rotation=45)
+        plt.title('Mid Yields')
+        plt.xlabel('Date')
+        plt.ylabel('Mid Yields')
+        plt.legend()
+        plt.show()
+        return df
+    elif CurveType == "discount":
+        # Plot the discount factors using a 6 month discretization
+        plt.figure(figsize=(15, 6))
+        plt.plot(df['Date'], df['DiscountFactor'], label=label)
+        #extract the year from the date and show it on the x-axis
+        plt.xticks(df['Date'], df['Date'].apply(lambda x: x.strftime('%Y')), rotation=45)
+        plt.title('Discount Factors')
+        plt.xlabel('Date')
+        plt.ylabel('Discount Factor')
+        plt.legend()
+        plt.show()
+        return df
+    elif CurveType == "discount_6m":
+        df_6m = pd.DataFrame(list(zip(dates_6m, discount_factors_mid_6m)), columns=['Date', 'MidDiscountFactors'])
+        df_6m['Date'] = df_6m['Date'].apply(lambda x: x.to_date())
+        # Plot the discount factors using a 6 month discretization
+        plt.figure(figsize=(15, 8))
+        plt.plot(df_6m['Date'], df_6m['MidDiscountFactors'], label="mid_discount")
+        plt.plot(df_6m['Date'], df_6m['AskDiscountFactors'], label="ask_discount")
+        plt.plot(df_6m['Date'], df_6m['BidDiscountFactors'], label="bid_discount")
+        plt.xticks(df_6m['Date'], df_6m['Date'].apply(lambda x: x.strftime('%b %Y')), rotation=45)
+        plt.title('Discount Factors')
+        plt.xlabel('Date')
+        plt.ylabel('Discount Factor')
+        plt.legend()
+        plt.show()
+        return df_6m   
