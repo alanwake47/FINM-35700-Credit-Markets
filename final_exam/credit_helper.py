@@ -3,6 +3,10 @@ import QuantLib as ql
 import numpy as np
 import pandas as pd
 import datetime as dt
+from scipy.optimize import minimize
+from scipy.stats import norm
+
+
 
 import matplotlib.pyplot as plt
 
@@ -604,4 +608,202 @@ def calc_scenario_sensi(calc_date,sym_md_df, tsy_yield_curve_handle, default_pro
     sym_md_df['CS01'] = model_cs01
     sym_md_df['Rec01'] = model_rec01
     
-    return sym_md_df    
+    return sym_md_df
+
+
+def nelson_siegel(params, maturity):
+    ''' params = (theta1, theta2, theta3, lambda)'''        
+    if(maturity == 0 or params[3] <= 0):
+        slope_1 = 1
+        curvature = 0
+    else:
+        slope_1 = (1 - np.exp(-maturity/params[3]))/(maturity/params[3])
+        curvature = slope_1 - np.exp(-maturity/params[3])
+
+    total_value = params[0] + params[1] * slope_1 + params[2] * curvature
+    
+    return total_value
+
+def create_nelson_siegel_curve(calc_date, nelson_siegel_params):
+    ''' nelson_siegel_params = (theta1, theta2, theta3, lambda)'''            
+    nelson_siegel_surv_prob_dates = [calc_date + ql.Period(T , ql.Years) for T in range(31)]
+    nelson_siegel_average_hazard_rates = [nelson_siegel(nelson_siegel_params, T) for T in range(31)]
+    nelson_siegel_surv_prob_levels = [np.exp(-T * nelson_siegel_average_hazard_rates[T]) for T in range(31)]
+    
+    # cap and floor survival probs
+    nelson_siegel_surv_prob_levels = [max(min(x,1),1e-8) for x in nelson_siegel_surv_prob_levels]
+
+    # nelson_siegel_surv_prob_curve
+    nelson_siegel_credit_curve = ql.SurvivalProbabilityCurve(nelson_siegel_surv_prob_dates, nelson_siegel_surv_prob_levels, ql.Actual360(), ql.TARGET())
+    nelson_siegel_credit_curve.enableExtrapolation()
+    nelson_siegel_credit_curve_handle = ql.DefaultProbabilityTermStructureHandle(nelson_siegel_credit_curve)
+    
+    return(nelson_siegel_credit_curve_handle)
+
+
+def calculate_nelson_siegel_model_prices_and_yields(nelson_siegel_params, 
+                      calc_date, 
+                      fixed_rate_bond_objects, 
+                      tsy_yield_curve_handle, 
+                      bond_recovery_rate = 0.4):
+    
+    # nelson_siegel_surv_prob_curve_handle
+    nelson_siegel_surv_prob_curve_handle = create_nelson_siegel_curve(calc_date, nelson_siegel_params)
+    
+    # nelson_siegel_risky_bond_engine
+    nelson_siegel_risky_bond_engine = ql.RiskyBondEngine(nelson_siegel_surv_prob_curve_handle, bond_recovery_rate, tsy_yield_curve_handle)
+    
+    bond_model_prices = []
+    bond_model_yields = []
+    
+    for fixed_rate_bond in fixed_rate_bond_objects:
+        fixed_rate_bond.setPricingEngine(nelson_siegel_risky_bond_engine)
+        
+        bond_price = fixed_rate_bond.cleanPrice()                
+        bond_yield = fixed_rate_bond.bondYield(bond_price, ql.Thirty360(ql.Thirty360.USA), ql.Compounded, ql.Semiannual) * 100
+        
+        bond_model_prices.append(bond_price)
+        bond_model_yields.append(bond_yield)
+    
+    return(bond_model_prices, bond_model_yields)
+
+def nelson_siegel_sse(nelson_siegel_params, 
+                      calc_date, 
+                      fixed_rate_bond_objects, 
+                      market_prices, 
+                      calib_weights,
+                      tsy_yield_curve_handle, 
+                      bond_recovery_rate = 0.4):
+    
+    # bond_model_prices
+    bond_model_prices, bond_model_yields = calculate_nelson_siegel_model_prices_and_yields(nelson_siegel_params, 
+                      calc_date, 
+                      fixed_rate_bond_objects, 
+                      tsy_yield_curve_handle, 
+                      bond_recovery_rate)
+    # sse    
+    sse = 0
+    
+    for i in range(len(market_prices)):
+        model_error = market_prices[i] - bond_model_prices[i]                
+        sse += model_error * model_error * calib_weights[i]                        
+    
+    return(sse)    
+
+
+def create_bonds_and_weights(bond_details, tsy_yield_curve_handle):
+    
+    # risk_free_bond_engine
+    risk_free_bond_engine = ql.DiscountingBondEngine(tsy_yield_curve_handle)
+
+
+    fixed_rate_bond_objects = []
+    bond_market_prices = []    
+    bond_yields = []
+    bond_DV01s = []    
+    bond_durations = []    
+    
+    for index,row in bond_details.iterrows():
+        fixed_rate_bond = create_bond_from_symbology(row)
+        fixed_rate_bond.setPricingEngine(risk_free_bond_engine)
+        
+        fixed_rate_bond_objects.append(fixed_rate_bond)
+        
+        bond_price = row['market_price']                
+        bond_yield = fixed_rate_bond.bondYield(bond_price, ql.Thirty360(ql.Thirty360.USA), ql.Compounded, ql.Semiannual) * 100
+        bond_yield_rate = ql.InterestRate(bond_yield/100, ql.ActualActual(ql.ActualActual.ISMA), ql.Compounded, ql.Semiannual)
+        bond_duration = ql.BondFunctions.duration(fixed_rate_bond, bond_yield_rate)
+        bond_DV01   = fixed_rate_bond.dirtyPrice() * bond_duration
+        
+        bond_market_prices.append(bond_price)
+        bond_yields.append(bond_yield)
+        bond_DV01s.append(bond_DV01)
+        bond_durations.append(bond_duration)   
+        
+    # calib_weights: down-weight durations < 2 years, since the calibrated US treasury does not have quotes before 2Y
+    calib_weights = [1 / max(d, 2) for d in bond_durations]
+    sum_calib_weights = sum(calib_weights)
+    calib_weights = [x / sum_calib_weights for x in calib_weights]
+    
+    return(fixed_rate_bond_objects, calib_weights, bond_market_prices, bond_yields, bond_DV01s, bond_durations)
+    
+def calibrate_nelson_siegel_model(initial_nelson_siegel_params,
+                                  calc_date, 
+                                  bond_details, 
+                                  tsy_yield_curve_handle, 
+                                  bond_recovery_rate = 0.4):
+    # create_bonds_and_weights
+    fixed_rate_bond_objects, calib_weights, bond_market_prices, bond_yields, bond_DV01s, bond_durations = create_bonds_and_weights(bond_details, tsy_yield_curve_handle)
+    
+    # start calibration
+    param_bounds = [(1e-3, 0.1), (-0.1, 0.1), (-0.1, 0.1), (1e-3, 10)]
+            
+    calib_results = minimize(nelson_siegel_sse,
+                                            initial_nelson_siegel_params, 
+                                            args = (calc_date, 
+                                                    fixed_rate_bond_objects, 
+                                                    bond_market_prices, 
+                                                    calib_weights,
+                                                    tsy_yield_curve_handle, 
+                                                    bond_recovery_rate),
+                                            bounds = param_bounds)
+
+
+    return(calib_results)
+
+def calc_d1_d2(A,r,sigma_A,T,L):
+    d1 = (-np.log(L/A) + (r + 0.5 * sigma_A**2)* T ) / (sigma_A * np.sqrt(T))
+    d2 = (-np.log(L/A) + (r - 0.5 * sigma_A**2)* T ) / (sigma_A * np.sqrt(T))    
+    return (d1, d2)
+
+def fairValueEquity(A,r,sigma_A,T,L):
+    d1, d2 = calc_d1_d2(A,r,sigma_A,T,L)
+    E0  = A * norm.cdf(d1) - np.exp(-r * T) * L * norm.cdf(d2)
+    return E0
+
+def fairValueRiskyBond(A,r,sigma_A,T,L):
+    d1, d2 = calc_d1_d2(A,r,sigma_A,T,L)
+    B0  = A * norm.cdf(-d1) + L * np.exp(-r * T) * norm.cdf(d2)
+    
+    return B0
+
+def defaultProbability(A,r,sigma_A,T,K):
+    d1, d2 = calc_d1_d2(A,r,sigma_A,T,K)
+    default_prob = norm.cdf(-d2)
+    
+    return default_prob
+
+def survivalProbability(A,r,sigma_A,T,L):
+    return(1 - defaultProbability(A,r,sigma_A,T,L))
+
+def distanceToDefault(A,r,sigma_A,T,K):
+    d1, d2 = calc_d1_d2(A,r,sigma_A,T,K)        
+    return(d2)
+
+def riskyBondYield(A,r,sigma_A,T,K):
+    B0 = fairValueRiskyBond(A,r,sigma_A,T,K)
+    bond_yield = - np.log(B0/K) / T       
+    return bond_yield
+
+def riskyBondCreditSpread(A,r,sigma_A,T,K):
+    bond_yield = riskyBondYield(A,r,sigma_A,T,K)    
+    bond_credit_spread = bond_yield - r
+    return bond_credit_spread
+
+def flatHazardRate(A,r,sigma_A,T,K):
+    survival_prob = survivalProbability(A,r,sigma_A,T,K)
+    flat_hazard_rate = - np.log(survival_prob) / T
+    return flat_hazard_rate
+
+def expectedRecoveryRate(A,r,sigma_A,T,K):
+    d1, d2 = calc_d1_d2(A,r,sigma_A,T,K)    
+    exp_rec_rate = A / K * norm.cdf(-d1)/norm.cdf(-d2)
+    return exp_rec_rate
+
+def equityVolatility(A,r,sigma_A,T,K):
+    d1, d2 = calc_d1_d2(A,r,sigma_A,T,K)    
+    E0 = fairValueEquity(A,r,sigma_A,T,K)    
+    sigma_E = (A / E0) * norm.cdf(d1) * sigma_A
+    return sigma_E
+
+
