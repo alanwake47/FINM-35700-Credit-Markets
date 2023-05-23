@@ -207,10 +207,10 @@ def calibrate_cds_hazard_rate_curve(calc_date, sofr_yield_curve_handle, cds_par_
     return(hazard_rate_curve)
 
 # Calculate initial term and current time-to-maturity for each bond issue
-def get_symbology(df, underlying=False):
+def get_symbology(df: pd.DataFrame):
     for index, row in df.iterrows():
-        start_date = ql.Date(row['start_date'].day, row['start_date'].month, row['start_date'].year)
-        maturity_date = ql.Date(row['maturity'].day, row['maturity'].month, row['maturity'].year)
+        start_date = get_ql_date(row['start_date'])
+        maturity_date = get_ql_date(row['maturity'])
         today_date = ql.Date(14,4,2023)
         calendar = ql.UnitedStates(ql.UnitedStates.GovernmentBond)
         #set dcc as Actual/365.25
@@ -236,7 +236,7 @@ def calc_clean_price_with_zspread(fixed_rate_bond, yield_curve_handle, zspread):
     bond_clean_price = fixed_rate_bond.cleanPrice()
     return bond_clean_price
 
-def get_interp_tsy_yield(corp_symbology, otr):
+def get_interp_tsy_yield(corp_symbology: pd.DataFrame, otr: pd.DataFrame):
     corp_symbology['interp_tsy_yield'] = 0
     for i in range(len(corp_symbology)):
         if corp_symbology['TTM'][i] <= otr['TTM'][0]:
@@ -307,12 +307,181 @@ def plot_yield_curve(mid, start_date: ql.Date, end_date: ql.Date, day_count: ql.
         # Plot the discount factors using a 6 month discretization
         plt.figure(figsize=(15, 8))
         plt.plot(df_6m['Date'], df_6m['MidDiscountFactors'], label="mid_discount")
-        plt.plot(df_6m['Date'], df_6m['AskDiscountFactors'], label="ask_discount")
-        plt.plot(df_6m['Date'], df_6m['BidDiscountFactors'], label="bid_discount")
         plt.xticks(df_6m['Date'], df_6m['Date'].apply(lambda x: x.strftime('%b %Y')), rotation=45)
         plt.title('Discount Factors')
         plt.xlabel('Date')
         plt.ylabel('Discount Factor')
         plt.legend()
         plt.show()
-        return df_6m   
+        return df_6m
+
+
+def calc_bond_metrics(symbology_df: pd.DataFrame, calc_date: ql.Date, model="flat", coupon_freq=ql.Semiannual, yc=None):
+    
+    ql.Settings.instance().evaluationDate = calc_date
+    
+    sorted_details_frame = symbology_df.copy()
+    flat_rate = ql.SimpleQuote(0.05)
+    compounding = ql.Compounded 
+    
+    for index, row in sorted_details_frame.iterrows():
+        fixed_rate_bond = create_bond_from_symbology(row)
+        if model == "flat":
+            flat_int_rate = ql.InterestRate(flat_rate.value(), fixed_rate_bond.dayCounter(), compounding, coupon_freq)
+            bond_duration = ql.BondFunctions.duration(fixed_rate_bond, flat_int_rate)
+            bond_convexity = ql.BondFunctions.convexity(fixed_rate_bond, flat_int_rate)
+            dv01 = row['mid_dirty'] * bond_duration
+            sorted_details_frame.loc[index, 'dv01'] = dv01/100
+            sorted_details_frame.loc[index, 'duration'] = bond_duration/100
+            sorted_details_frame.loc[index, 'convexity'] = bond_convexity
+        elif model == "yc":
+            interest_rate_bump = ql.SimpleQuote(0.0)
+            flat_yield_curve_bumped = ql.ZeroSpreadedTermStructure(yc, ql.QuoteHandle(interest_rate_bump))
+            bond_engine = ql.DiscountingBondEngine(ql.YieldTermStructureHandle(flat_yield_curve_bumped))
+            fixed_rate_bond.setPricingEngine(bond_engine)
+            price_base = fixed_rate_bond.NPV()
+            #-1 bp change in yield
+            interest_rate_bump.setValue(-0.0001)
+            price_base_1bp = fixed_rate_bond.NPV()
+            dv01 = (price_base_1bp - price_base) * 100
+            bond_duration = dv01 / row['mid_dirty']
+            interest_rate_bump.setValue(0.0001)
+            price_base_1bp_u = fixed_rate_bond.NPV()
+            bond_convexity = (price_base_1bp_u + price_base_1bp - 2 * price_base) * 1000000 / row['mid_dirty'] *100
+            sorted_details_frame.loc[index, 'scen_dv01'] = dv01
+            sorted_details_frame.loc[index, 'scen_duration'] = bond_duration
+            sorted_details_frame.loc[index, 'scen_convexity'] = bond_convexity
+        else:
+            print("Please enter a valid model")
+
+    return sorted_details_frame
+
+def calc_yield_to_worst(
+            details: dict,
+            pc_schedule: pd.DataFrame,
+            bond_clean_price: float,
+            calc_date: ql.Date):
+    '''Computes yield-to-worst and workout date for fixed rate callable bonds.
+    '''    
+    
+    maturity_date =  details['maturity']
+    yield_to_maturity = details['yield_to_maturity']
+
+    workout_date = maturity_date
+    yield_to_worst = yield_to_maturity        
+    
+    # keep schedules for used bond only
+    used_pc_schedule = pc_schedule[pc_schedule['figi'] == details['figi']]
+    
+    for _, row in used_pc_schedule.iterrows():
+        call_date = get_ql_date(row['call_date'])
+        if call_date > calc_date:
+            
+            # Create a call scenario details df
+            call_scenario_details = details.copy()
+            call_scenario_details['maturity'] = row['call_date']
+            call_scenario_bond = create_bond_from_symbology(call_scenario_details)
+            
+            # scenario_yield
+            call_scenario_yield = call_scenario_bond.bondYield(bond_clean_price, call_scenario_bond.dayCounter(), ql.Compounded, ql.Semiannual) * 100
+                                            
+            # Update yield_to_worst and workout_date if needed
+            if call_scenario_yield < yield_to_worst:
+                print('Found new workout date:', details['figi'], workout_date, call_date.to_date(), yield_to_worst, call_scenario_yield)
+                
+                yield_to_worst = call_scenario_yield
+                workout_date = call_date.to_date()                                                            
+                
+    return workout_date, yield_to_worst
+
+
+def get_yield_curve_details_df(yield_curve, curve_dates=None):
+    
+    if(curve_dates == None):
+        curve_dates = yield_curve.dates()
+
+    dates = [d.to_date() for d in curve_dates]
+    discounts = [round(yield_curve.discount(d), 3) for d in curve_dates]
+    yearfracs = [round(yield_curve.timeFromReference(d), 3) for d in curve_dates]
+    zeroRates = [round(yield_curve.zeroRate(d, yield_curve.dayCounter(), ql.Compounded).rate() * 100, 3) for d in curve_dates]
+
+    yield_curve_details_df = pd.DataFrame(data={'Date': dates,
+                             'YearFrac': yearfracs,
+                             'DiscountFactor': discounts,
+                             'ZeroRate': zeroRates})                             
+    return yield_curve_details_df
+
+
+def get_hazard_rates_df(hazard_rate_curve,calc_date):
+    '''Return dataframe with calibrated hazard rates and survival probabilities'''
+    
+    CDS_day_count = ql.Actual360()
+    
+    hazard_list = [(hr[0].to_date(), 
+                CDS_day_count.yearFraction(calc_date, hr[0]),
+                hr[1] * 1e4,
+                hazard_rate_curve.survivalProbability(hr[0])) for hr in hazard_rate_curve.nodes()]
+
+    grid_dates, year_frac, hazard_rates, surv_probs = zip(*hazard_list)
+
+    hazard_rates_df = pd.DataFrame(data={'Date': grid_dates, 
+                                     'YearFrac': year_frac,
+                                     'HazardRateBps': hazard_rates,                                     
+                                     'SurvivalProb': surv_probs})
+    return(hazard_rates_df)
+
+
+def create_cds_object(cds_start_date, cds_maturity_date):
+    # Common CDS specs
+    side = ql.Protection.Seller
+    cds_recovery_rate = 0.4
+    cds_face_notional = 100
+    contractual_spread_bps = 100
+
+    # Create common CDS schedule
+    cds_schedule = ql.MakeSchedule(cds_start_date, cds_maturity_date, ql.Period('3M'),
+                                ql.Quarterly, ql.TARGET(), ql.Following, ql.Unadjusted, ql.DateGeneration.TwentiethIMM)
+
+    # Create common CDS object
+    cds_object = ql.CreditDefaultSwap(side, cds_face_notional, contractual_spread_bps / 1e4, cds_schedule, ql.Following, ql.Actual360())
+    return cds_object
+
+
+def create_cds_pricing_engine(calc_date, sofr_yield_curve_handle, cds_par_spread_5y_bps, cds_recovery_rate = 0.4):
+    '''Calibrate hazard rate curve and create cds pricing engines from 5Y CDS Par Spreads'''
+
+    # CDS tenor: 5Y only
+    CDS_tenor_5Y = ql.Period(5, ql.Years)
+
+    CDS_helpers = [ql.SpreadCdsHelper(cds_par_spread_5y_bps * 1e-4, CDS_tenor_5Y, 2, ql.TARGET(),
+                                  ql.Quarterly, ql.Following, ql.DateGeneration.TwentiethIMM, ql.Actual360(), cds_recovery_rate, sofr_yield_curve_handle)]
+
+    # bootstrap hazard_rate_curve
+    hazard_rate_curve = ql.PiecewiseFlatHazardRate(calc_date, CDS_helpers, ql.Actual360())
+    hazard_rate_curve.enableExtrapolation()
+
+    # Create CDS pricing engine
+    default_prob_curve_handle = ql.DefaultProbabilityTermStructureHandle(hazard_rate_curve)
+    cds_pricing_engine = ql.MidPointCdsEngine(default_prob_curve_handle, cds_recovery_rate, sofr_yield_curve_handle)
+
+    return(cds_pricing_engine)
+
+
+
+#Create a function to price each OTR treasruy using the above bond engine. Extend the datafram with a column 'calc_mid' with the calculated mid price
+def price_bond(symbology_df: pd.DataFrame, bond_engine, calc_date: ql.Date, risky_bond=False):
+    
+    ql.Settings.instance().evaluationDate = calc_date
+    
+    # Sort dataframe by maturity
+    sorted_details_frame = symbology_df.copy() 
+    
+    for index, row in sorted_details_frame.iterrows():
+        fixed_rate_bond = create_bond_from_symbology(row)
+        fixed_rate_bond.setPricingEngine(bond_engine)
+        pv_engine = fixed_rate_bond.NPV()
+        
+        sorted_details_frame.loc[index, 'calc_mid'] = pv_engine
+            
+            
+    return sorted_details_frame
