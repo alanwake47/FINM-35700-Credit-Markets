@@ -485,3 +485,123 @@ def price_bond(symbology_df: pd.DataFrame, bond_engine, calc_date: ql.Date, risk
             
             
     return sorted_details_frame
+
+
+def calc_scenario_sensi(calc_date,sym_md_df, tsy_yield_curve_handle, default_prob_curve_handle,cds_par_spd,sofr_yield_curve_handle, flat_recovery_rate=0.4,flat_rec_bump=0):
+    def bump_down_engine(bump=-0.0001):
+        # Bump interest rate by -1bps (parallel shift)
+        interest_rate_scenario_1bp_down = ql.SimpleQuote(bump)
+        tsy_yield_curve_handle_1bp_down = ql.YieldTermStructureHandle(ql.ZeroSpreadedTermStructure(tsy_yield_curve_handle, ql.QuoteHandle(interest_rate_scenario_1bp_down)))
+        risky_bond_engine_1bp_down = ql.RiskyBondEngine(default_prob_curve_handle, flat_recovery_rate, tsy_yield_curve_handle_1bp_down)
+        return risky_bond_engine_1bp_down
+        
+    def bump_up_engine(bump=0.0001):
+        # Bump interest rate by +1bps (parallel shift)
+        interest_rate_scenario_1bp_up = ql.SimpleQuote(bump)
+        tsy_yield_curve_handle_1bp_up = ql.YieldTermStructureHandle(ql.ZeroSpreadedTermStructure(tsy_yield_curve_handle, ql.QuoteHandle(interest_rate_scenario_1bp_up)))
+        risky_bond_engine_1bp_up = ql.RiskyBondEngine(default_prob_curve_handle, flat_recovery_rate, tsy_yield_curve_handle_1bp_up)
+        return risky_bond_engine_1bp_up
+    
+    def flat_engine(flat_rec_bump=0):
+        # Flat interest rate
+        interest_rate_scenario_flat = ql.SimpleQuote(0.0)
+        tsy_yield_curve_handle_flat = ql.YieldTermStructureHandle(ql.ZeroSpreadedTermStructure(tsy_yield_curve_handle, ql.QuoteHandle(interest_rate_scenario_flat)))
+        risky_bond_engine_flat = ql.RiskyBondEngine(default_prob_curve_handle, flat_recovery_rate+flat_rec_bump, tsy_yield_curve_handle_flat)
+        return risky_bond_engine_flat
+    
+    def cds_par_bump_down(bump=-1):
+        cds_par_spreads_1bp_down = [ps - 1 for ps in cds_par_spd]
+        hazard_rate_curve_1bp_down = calibrate_cds_hazard_rate_curve(calc_date, sofr_yield_curve_handle, cds_par_spreads_1bp_down, flat_recovery_rate)
+        default_prob_curve_handle_1bp_down = ql.DefaultProbabilityTermStructureHandle(hazard_rate_curve_1bp_down)
+        risky_bond_engine_cds_1bp_down = ql.RiskyBondEngine(default_prob_curve_handle_1bp_down, flat_recovery_rate, tsy_yield_curve_handle)
+        return risky_bond_engine_cds_1bp_down
+        
+    
+    model_prices_1bp_up = []
+    model_prices_1bp_down = []
+    model_ir01 = []
+    model_duration = []
+    model_convexity = []
+    model_analytic_duration = []
+    model_analytic_convexity = []
+    model_hr01 = []
+    model_cs01 = []
+    model_rec01 = []
+    
+    bonds = [create_bond_from_symbology(df_row.to_dict()) for index, df_row in sym_md_df.iterrows()]
+    
+    for i in range(0, len(bonds)):
+        fixed_rate_bond = bonds[i]
+    
+        # Calc model dirty price for base case
+        fixed_rate_bond.setPricingEngine(flat_engine())
+        dirty_price_base = fixed_rate_bond.dirtyPrice()
+        corpBondModelPrice = round(fixed_rate_bond.cleanPrice(), 3)
+        corpBondModelYield = round(fixed_rate_bond.bondYield(corpBondModelPrice, ql.Thirty360(ql.Thirty360.USA), ql.Compounded, ql.Semiannual) * 100, 3)
+
+        # Compute analytical duration and convexity (optional metrics)
+        bond_yield_rate = ql.InterestRate(corpBondModelYield/100, ql.ActualActual(ql.ActualActual.ISMA), ql.Compounded, ql.Semiannual)
+        analytic_duration = ql.BondFunctions.duration(fixed_rate_bond, bond_yield_rate)
+        analytic_convexity = ql.BondFunctions.convexity(fixed_rate_bond, bond_yield_rate)
+
+        # Scenario: 1bp down
+        fixed_rate_bond.setPricingEngine(bump_down_engine())   
+        price_1bp_down = fixed_rate_bond.cleanPrice()
+        model_prices_1bp_down.append(price_1bp_down)
+        
+        # Scenario: 10bp down
+        fixed_rate_bond.setPricingEngine(bump_down_engine(-0.001))
+        price_10bp_down = fixed_rate_bond.cleanPrice()
+        
+        # Scenario: 1bp up
+        fixed_rate_bond.setPricingEngine(bump_up_engine())
+        price_1bp_up = fixed_rate_bond.cleanPrice()
+        model_prices_1bp_up.append(price_1bp_up)
+        
+        # Scenario: 10bp up
+        fixed_rate_bond.setPricingEngine(bump_up_engine(0.001))
+        price_10bp_up = fixed_rate_bond.cleanPrice()
+        
+        # Scenario: CDS 1bp down
+        fixed_rate_bond.setPricingEngine(cds_par_bump_down())
+        price_cds_1bp_down = fixed_rate_bond.cleanPrice()
+        yield_cds_1bp_down = fixed_rate_bond.bondYield(price_cds_1bp_down, ql.Thirty360(ql.Thirty360.USA), ql.Compounded, ql.Semiannual) * 100
+        price_diff_cds_1bp_down = price_cds_1bp_down - corpBondModelPrice
+        yield_diff_cds_1bp_down = yield_cds_1bp_down - corpBondModelYield
+        
+        # Scenario: Recovery rate 1% up
+        fixed_rate_bond.setPricingEngine(flat_engine(0.01))
+        price_rec_1p_up = fixed_rate_bond.cleanPrice()
+        
+        # Compute scenario delta/gamma sensitivities
+        price_base = corpBondModelPrice
+        ir01 = (price_1bp_down - price_base) * 1e4 / 100
+        duration = ir01 / dirty_price_base * 100
+        # Convexity
+        gamma_1bp = (price_10bp_down - 2*price_base + price_10bp_up) * 1e6 / 100
+        convexity = gamma_1bp / dirty_price_base * 100
+        # HR01/CS01
+        hr01 = - price_diff_cds_1bp_down / yield_diff_cds_1bp_down
+        cs01 = price_diff_cds_1bp_down * 1e4 / 100
+        # Rec01
+        rec01 = (price_rec_1p_up - price_base)
+        
+        model_ir01.append(ir01)
+        model_duration.append(duration)
+        model_convexity.append(convexity)    
+        model_analytic_duration.append(analytic_duration)
+        model_analytic_convexity.append(analytic_convexity)
+        model_hr01.append(hr01)
+        model_cs01.append(cs01)
+        model_rec01.append(rec01)
+    
+    sym_md_df['IRO1'] = model_ir01
+    sym_md_df['Duration'] = model_duration
+    sym_md_df['Convexity'] = model_convexity
+    sym_md_df['Analytic Duration'] = model_analytic_duration
+    sym_md_df['Analytic Convexity'] = model_analytic_convexity
+    sym_md_df['HR01'] = model_hr01
+    sym_md_df['CS01'] = model_cs01
+    sym_md_df['Rec01'] = model_rec01
+    
+    return sym_md_df    
