@@ -5,6 +5,7 @@ import pandas as pd
 import datetime as dt
 from scipy.optimize import minimize
 from scipy.stats import norm
+from scipy import optimize
 
 
 
@@ -435,7 +436,7 @@ def get_hazard_rates_df(hazard_rate_curve,calc_date):
     return(hazard_rates_df)
 
 
-def create_cds_object(cds_start_date, cds_maturity_date):
+def create_cds_obj(cds_start_date, cds_maturity_date):
     # Common CDS specs
     side = ql.Protection.Seller
     cds_recovery_rate = 0.4
@@ -447,17 +448,16 @@ def create_cds_object(cds_start_date, cds_maturity_date):
                                 ql.Quarterly, ql.TARGET(), ql.Following, ql.Unadjusted, ql.DateGeneration.TwentiethIMM)
 
     # Create common CDS object
-    cds_object = ql.CreditDefaultSwap(side, cds_face_notional, contractual_spread_bps / 1e4, cds_schedule, ql.Following, ql.Actual360())
-    return cds_object
+    cds_obj = ql.CreditDefaultSwap(side, cds_face_notional, contractual_spread_bps / 1e4, cds_schedule, ql.Following, ql.Actual360())
+    return cds_obj
 
 
-def create_cds_pricing_engine(calc_date, sofr_yield_curve_handle, cds_par_spread_5y_bps, cds_recovery_rate = 0.4):
-    '''Calibrate hazard rate curve and create cds pricing engines from 5Y CDS Par Spreads'''
+def create_cds_pricing_engine(calc_date, sofr_yield_curve_handle, cds_par_spread_5y_bps, cds_recovery_rate = 0.4, cds_tenor = 5):
+    '''Calibrate hazard rate curve and create cds pricing engines from CDS Par Spreads'''
 
-    # CDS tenor: 5Y only
-    CDS_tenor_5Y = ql.Period(5, ql.Years)
+    CDS_tenor = ql.Period(cds_tenor, ql.Years)
 
-    CDS_helpers = [ql.SpreadCdsHelper(cds_par_spread_5y_bps * 1e-4, CDS_tenor_5Y, 2, ql.TARGET(),
+    CDS_helpers = [ql.SpreadCdsHelper(cds_par_spread_5y_bps * 1e-4, CDS_tenor, 2, ql.TARGET(),
                                   ql.Quarterly, ql.Following, ql.DateGeneration.TwentiethIMM, ql.Actual360(), cds_recovery_rate, sofr_yield_curve_handle)]
 
     # bootstrap hazard_rate_curve
@@ -806,4 +806,133 @@ def equityVolatility(A,r,sigma_A,T,K):
     sigma_E = (A / E0) * norm.cdf(d1) * sigma_A
     return sigma_E
 
+def cds_prem_def_pv(calc_date, cds_obj, cdx_basket_dataframe, sofr_yield_curve_handle, cds_recovery_rate=0.4, cds_tenor=5):
+    cds_premium_leg_pvs = []
+    cds_default_leg_pvs = []
+    cds_pvs = []
+    
+    #weighted pvs
+    cdx_ig_5y_premium_leg_pv = 0
+    cdx_ig_5y_default_leg_pv = 0
+    cdx_ig_5y_pv = 0
+    
+    for i in range(cdx_basket_dataframe.shape[0]):
+        par_spread = cdx_basket_dataframe.iloc[i]['cds_par_spread_5y']
+        cds_basket_weight = cdx_basket_dataframe.iloc[i]['index_weight'] /100
+        # create engine
+        cds_engine = create_cds_pricing_engine(calc_date, sofr_yield_curve_handle,par_spread, cds_recovery_rate, cds_tenor)
+        # setPricingEngine
+        cds_obj.setPricingEngine(cds_engine)
+        
+        # Calc individual CDS PVs
+        cds_premium_leg_pv = cds_obj.couponLegNPV()
+        cds_default_leg_pv = -cds_obj.defaultLegNPV()
+        cds_pv = cds_obj.NPV()
+        
+        # Weighted PVs
+        cdx_ig_5y_premium_leg_pv += (cds_premium_leg_pv * cds_basket_weight)
+        cdx_ig_5y_default_leg_pv += (cds_default_leg_pv * cds_basket_weight)
+        cdx_ig_5y_pv += (cds_pv * cds_basket_weight)
+        
+        cds_premium_leg_pvs.append(cds_premium_leg_pv)
+        cds_default_leg_pvs.append(cds_default_leg_pv)
+        cds_pvs.append(cds_pv)
+        
+    # Add results to cdx dataframe
+    cdx_basket_dataframe['premium_leg_pv'] = cds_premium_leg_pvs
+    cdx_basket_dataframe['default_leg_pv'] = cds_default_leg_pvs
+    cdx_basket_dataframe['cds_pv'] = cds_pvs
+        
+    print('CDS Premium Leg PV:', round(cdx_ig_5y_premium_leg_pv,3))
+    print('CDS Default Leg PV:', round(cdx_ig_5y_default_leg_pv,3))
+    print('CDS PV:', round(cdx_ig_5y_pv,3))
+    contractual_spread_bps = 100
+    par_spread = contractual_spread_bps * cdx_ig_5y_default_leg_pv / cdx_ig_5y_premium_leg_pv
+    print('Par Spread:', round(par_spread,3))
+    return cdx_basket_dataframe, cdx_ig_5y_premium_leg_pv, cdx_ig_5y_default_leg_pv, cdx_ig_5y_pv,par_spread
 
+
+def get_nav(hyg_dataframe):
+    # face notionals and weights
+    bond_face_notionals = hyg_dataframe['face_notional']
+    bond_face_notional_weights = hyg_dataframe['face_notional_weight']
+    
+    # bond objects and dirty prices
+    hyg_bond_objects = []
+    hyg_bond_dirty_prices = []
+    
+    # ETF intrinsic  NAV and Market Cap
+    hyg_intrinsic_nav = 0
+    hyg_intrinsic_market_cap = 0
+    
+    # bond objs
+    
+    for i, row in hyg_dataframe.iterrows():
+        # create bond object
+        bond_obj = create_bond_from_symbology(row)
+        
+        # bond_dirty_price                
+        bond_yield = row['yield_to_maturity'] / 100
+        bond_dirty_price = bond_obj.dirtyPrice(bond_yield, ql.Thirty360(ql.Thirty360.USA), ql.Compounded, ql.Semiannual)
+        
+        # hyg_basket_nav    
+        hyg_intrinsic_nav += bond_dirty_price * bond_face_notional_weights[i] / 100
+        
+        # hyg_basket_market_cap    
+        hyg_intrinsic_market_cap += bond_dirty_price * bond_face_notionals[i] / 100
+        
+        # Populate lists
+        hyg_bond_objects.append(bond_obj)
+        hyg_bond_dirty_prices.append(bond_dirty_price)
+        
+    ## Add dirty prices to hyg_df
+    hyg_dataframe['dirty_price'] = hyg_bond_dirty_prices
+    hyg_dataframe['bond_obj'] = hyg_bond_objects
+    
+    return hyg_dataframe, hyg_intrinsic_nav, hyg_intrinsic_market_cap
+
+
+def calc_etf_nav_from_yield(etf_yield, hyg_bond_objects, bond_face_notional_weights):
+    
+    # etf_intrinsic_nav
+    etf_intrinsic_nav = 0
+    
+    # loop over bonds
+    for i in range(len(hyg_bond_objects)):
+        bond_object = hyg_bond_objects[i]
+        # calc bond_dirty_price
+        bond_dirty_price = bond_object.dirtyPrice(etf_yield, ql.Thirty360(ql.Thirty360.USA), ql.Compounded, ql.Semiannual)        
+        
+        # update etf_intrinsic_nav
+        etf_intrinsic_nav += bond_dirty_price * bond_face_notional_weights[i] / 100
+        
+    return(etf_intrinsic_nav)
+
+
+def calc_etf_nav_from_zspread(etf_zspread, hyg_bond_objects, bond_face_notional_weights, tsy_yield_curve_handle):
+    
+    # Add z-spread to tsy_yield_curve_handle and obtain yield_curve_bumped_handle
+    zspread_quote_handle = ql.QuoteHandle(ql.SimpleQuote(etf_zspread))
+    yield_curve_bumped = ql.ZeroSpreadedTermStructure(tsy_yield_curve_handle, zspread_quote_handle, ql.Compounded, ql.Semiannual)
+    yield_curve_bumped_handle = ql.YieldTermStructureHandle(yield_curve_bumped)
+    
+    # zspread_bond_engine
+    zspread_bond_engine = ql.DiscountingBondEngine(yield_curve_bumped_handle)
+    
+    # etf_intrinsic_nav
+    etf_intrinsic_nav = 0
+    
+    # loop over bonds
+    for i in range(len(hyg_bond_objects)):        
+        
+        bond_object = hyg_bond_objects[i]
+        bond_object.setPricingEngine(zspread_bond_engine)
+        
+        # calc bond_dirty_price        
+        bond_dirty_price = bond_object.dirtyPrice()                
+        
+        # update etf_intrinsic_nav
+        etf_intrinsic_nav += bond_dirty_price * bond_face_notional_weights[i] / 100
+        
+    return(etf_intrinsic_nav)
+    
