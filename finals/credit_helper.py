@@ -354,7 +354,7 @@ def calc_bond_metrics(symbology_df: pd.DataFrame, calc_date: ql.Date, model="fla
             price_base_1bp_u = fixed_rate_bond.NPV()
             bond_convexity = (price_base_1bp_u + price_base_1bp - 2 * price_base) * 1000000 / row['mid_dirty'] *100
             sorted_details_frame.loc[index, 'scen_dv01'] = dv01
-            sorted_details_frame.loc[index, 'scen_duration'] = bond_duration
+            sorted_details_frame.loc[index, 'scen_duration'] = bond_duration *100
             sorted_details_frame.loc[index, 'scen_convexity'] = bond_convexity
         else:
             print("Please enter a valid model")
